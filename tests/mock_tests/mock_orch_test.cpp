@@ -189,7 +189,7 @@ void MockOrchTest::SetUp()
         APP_SRV6_SID_LIST_TABLE_NAME,
         APP_SRV6_MY_SID_TABLE_NAME
     };
-    gSrv6Orch = new Srv6Orch(m_app_db.get(), srv6_tables, gSwitchOrch, gVrfOrch, gNeighOrch);
+    gSrv6Orch = new Srv6Orch(m_config_db.get(), m_app_db.get(), srv6_tables, gSwitchOrch, gVrfOrch, gNeighOrch);
     gDirectory.set(gSrv6Orch);
     ut_orch_list.push_back((Orch **)&gSrv6Orch);
     gCrmOrch = new CrmOrch(m_config_db.get(), CFG_CRM_TABLE_NAME);

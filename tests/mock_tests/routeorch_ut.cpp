@@ -251,7 +251,7 @@ namespace routeorch_test
                 APP_SRV6_SID_LIST_TABLE_NAME,
                 APP_SRV6_MY_SID_TABLE_NAME
             };
-            gSrv6Orch = new Srv6Orch(m_app_db.get(), srv6_tables, gSwitchOrch, gVrfOrch, gNeighOrch);
+            gSrv6Orch = new Srv6Orch(m_config_db.get(), m_app_db.get(), srv6_tables, gSwitchOrch, gVrfOrch, gNeighOrch);
 
             ASSERT_EQ(gRouteOrch, nullptr);
             const int routeorch_pri = 5;

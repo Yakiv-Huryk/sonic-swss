@@ -194,7 +194,7 @@ namespace intfsorch_test
                 APP_SRV6_SID_LIST_TABLE_NAME,
                 APP_SRV6_MY_SID_TABLE_NAME
             };
-            gSrv6Orch = new Srv6Orch(m_app_db.get(), srv6_tables, gSwitchOrch, gVrfOrch, gNeighOrch);
+            gSrv6Orch = new Srv6Orch(m_config_db.get(), m_app_db.get(), srv6_tables, gSwitchOrch, gVrfOrch, gNeighOrch);
 
             // Start FlowCounterRouteOrch
             static const  vector<string> route_pattern_tables = {
