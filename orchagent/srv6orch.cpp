@@ -6,11 +6,13 @@
 #include "srv6orch.h"
 #include "sai_serialize.h"
 #include "crmorch.h"
+#include "subscriberstatetable.h"
 
 using namespace std;
 using namespace swss;
 
 #define ADJ_DELIMITER ','
+#define OVERLAY_RIF_DEFAULT_MTU 9100
 
 extern sai_object_id_t gSwitchId;
 extern sai_object_id_t  gVirtualRouterId;
@@ -18,6 +20,7 @@ extern sai_object_id_t  gUnderlayIfId;
 extern sai_srv6_api_t* sai_srv6_api;
 extern sai_tunnel_api_t* sai_tunnel_api;
 extern sai_next_hop_api_t* sai_next_hop_api;
+extern sai_router_interface_api_t* sai_router_intfs_api;
 
 extern RouteOrch *gRouteOrch;
 extern CrmOrch *gCrmOrch;
@@ -61,6 +64,232 @@ const map<string, sai_srv6_sidlist_type_t> sidlist_type_map =
     {"encaps",             SAI_SRV6_SIDLIST_TYPE_ENCAPS},
     {"encaps.red",         SAI_SRV6_SIDLIST_TYPE_ENCAPS_RED}
 };
+
+static bool mySidDscpModeToSai(const string& mode, sai_tunnel_dscp_mode_t& sai_mode)
+{
+    if (mode == "uniform")
+    {
+        sai_mode = SAI_TUNNEL_DSCP_MODE_UNIFORM_MODEL;
+        return true;
+    }
+
+    if (mode == "pipe")
+    {
+        sai_mode = SAI_TUNNEL_DSCP_MODE_PIPE_MODEL;
+        return true;
+    }
+
+    return false;
+}
+
+Srv6Orch::Srv6Orch(DBConnector *cfgDb, DBConnector *applDb, vector<string> &tableNames, SwitchOrch *switchOrch, VRFOrch *vrfOrch, NeighOrch *neighOrch):
+          Orch(applDb, tableNames),
+          m_vrfOrch(vrfOrch),
+          m_switchOrch(switchOrch),
+          m_neighOrch(neighOrch),
+          m_sidTable(applDb, APP_SRV6_SID_LIST_TABLE_NAME),
+          m_mysidTable(applDb, APP_SRV6_MY_SID_TABLE_NAME)
+{
+    m_neighOrch->attach(this);
+
+    auto cfgMySidTableSubTable = new SubscriberStateTable(cfgDb, APP_SRV6_MY_SID_TABLE_NAME, TableConsumable::DEFAULT_POP_BATCH_SIZE, 0);
+
+    deque<KeyOpFieldsValuesTuple> entries;
+    cfgMySidTableSubTable->pops(entries);
+    for (auto &entry : entries)
+    {
+        doTaskCfgMySidTable(entry);
+    }
+
+    Orch::addExecutor(new Consumer(cfgMySidTableSubTable, this, string(APP_SRV6_MY_SID_TABLE_NAME) + "cfgDB"));
+}
+
+bool Srv6Orch::getMySidEntryDscpMode(const string& my_sid, sai_tunnel_dscp_mode_t& dscp_mode) const
+{
+    auto found = my_sid_dscp_cfg_.find(my_sid);
+    if (found != end(my_sid_dscp_cfg_))
+    {
+        dscp_mode = found->second;
+        return true;
+    }
+
+    return false;
+}
+
+bool Srv6Orch::initIpInIpTunnel(MySidIpInIpTunnel& tunnel, sai_tunnel_dscp_mode_t dscp_mode)
+{
+    SWSS_LOG_ENTER();
+
+    vector<sai_attribute_t> overlay_intf_attrs;
+    sai_attribute_t attr;
+
+    attr.id = SAI_ROUTER_INTERFACE_ATTR_VIRTUAL_ROUTER_ID;
+    attr.value.oid = gVirtualRouterId;
+    overlay_intf_attrs.push_back(attr);
+
+    attr.id = SAI_ROUTER_INTERFACE_ATTR_TYPE;
+    attr.value.s32 = SAI_ROUTER_INTERFACE_TYPE_LOOPBACK;
+    overlay_intf_attrs.push_back(attr);
+
+    attr.id = SAI_ROUTER_INTERFACE_ATTR_MTU;
+    attr.value.u32 = OVERLAY_RIF_DEFAULT_MTU;
+    overlay_intf_attrs.push_back(attr);
+
+    auto status = sai_router_intfs_api->create_router_interface(&tunnel.overlay_rif_oid, gSwitchId, (uint32_t)overlay_intf_attrs.size(), overlay_intf_attrs.data());
+    if (status != SAI_STATUS_SUCCESS)
+    {
+        SWSS_LOG_ERROR("Failed to create overlay router interface for MySID IPinIP tunnel: %d", status);
+        return false;
+    }
+
+    vector<sai_attribute_t> tunnel_attrs;
+
+    attr.id = SAI_TUNNEL_ATTR_TYPE;
+    attr.value.s32 = SAI_TUNNEL_TYPE_IPINIP;
+    tunnel_attrs.push_back(attr);
+
+    attr.id = SAI_TUNNEL_ATTR_OVERLAY_INTERFACE;
+    attr.value.oid = tunnel.overlay_rif_oid;
+    tunnel_attrs.push_back(attr);
+
+    attr.id = SAI_TUNNEL_ATTR_UNDERLAY_INTERFACE;
+    attr.value.oid = gUnderlayIfId;
+    tunnel_attrs.push_back(attr);
+
+    attr.id = SAI_TUNNEL_ATTR_PEER_MODE;
+    attr.value.s32 = SAI_TUNNEL_PEER_MODE_P2MP;
+    tunnel_attrs.push_back(attr);
+
+    attr.id = SAI_TUNNEL_ATTR_DECAP_DSCP_MODE;
+    attr.value.s32 = dscp_mode;
+    tunnel_attrs.push_back(attr);
+
+    status = sai_tunnel_api->create_tunnel(&tunnel.tunnel_oid, gSwitchId, (uint32_t)tunnel_attrs.size(), tunnel_attrs.data());
+    if (status != SAI_STATUS_SUCCESS)
+    {
+        SWSS_LOG_ERROR("Failed to create MySID IPinIP tunnel: %d", status);
+        return false;
+    }
+
+    return true;
+}
+
+bool Srv6Orch::deinitIpInIpTunnel(MySidIpInIpTunnel& tunnel)
+{
+    SWSS_LOG_ENTER();
+
+    auto status = sai_tunnel_api->remove_tunnel(tunnel.tunnel_oid);
+    if (status != SAI_STATUS_SUCCESS)
+    {
+        SWSS_LOG_ERROR("Failed to remove MySID IPinIP tunnel: %d", status);
+        return false;
+    }
+
+    tunnel.tunnel_oid = SAI_NULL_OBJECT_ID;
+
+    status = sai_router_intfs_api->remove_router_interface(tunnel.overlay_rif_oid);
+    if (status != SAI_STATUS_SUCCESS)
+    {
+        SWSS_LOG_ERROR("Failed to remove MySID IPinIP tunnel RIF: %d", status);
+        return false;
+    }
+
+    tunnel.overlay_rif_oid = SAI_NULL_OBJECT_ID;
+
+    return true;
+}
+
+bool Srv6Orch::createMySidIpInIpTunnel(sai_tunnel_dscp_mode_t dscp_mode, sai_object_id_t& tunnel_oid)
+{
+    SWSS_LOG_ENTER();
+
+    MySidIpInIpTunnel& uniform_tunnel = my_sid_ipinip_tunnels_.dscp_uniform_tunnel;
+    MySidIpInIpTunnel& pipe_tunnel = my_sid_ipinip_tunnels_.dscp_pipe_tunnel;
+
+    MySidIpInIpTunnel& tunnel_info = (dscp_mode == SAI_TUNNEL_DSCP_MODE_UNIFORM_MODEL) ? uniform_tunnel : pipe_tunnel;
+    if (tunnel_info.refcount == 0)
+    {
+        auto ok = initIpInIpTunnel(tunnel_info, dscp_mode);
+        if (!ok) {
+            return false;
+        }
+    }
+
+    tunnel_info.refcount++;
+    tunnel_oid = tunnel_info.tunnel_oid;
+
+    return true;
+}
+
+bool Srv6Orch::removeMySidIpInIpTunnel(sai_tunnel_dscp_mode_t dscp_mode)
+{
+    SWSS_LOG_ENTER();
+
+    MySidIpInIpTunnel& uniform_tunnel = my_sid_ipinip_tunnels_.dscp_uniform_tunnel;
+    MySidIpInIpTunnel& pipe_tunnel = my_sid_ipinip_tunnels_.dscp_pipe_tunnel;
+
+    MySidIpInIpTunnel& tunnel_info = (dscp_mode == SAI_TUNNEL_DSCP_MODE_UNIFORM_MODEL) ? uniform_tunnel : pipe_tunnel;
+    tunnel_info.refcount--;
+
+    if (tunnel_info.refcount == 0)
+    {
+        return deinitIpInIpTunnel(tunnel_info);
+    }
+
+    return true;
+}
+
+bool Srv6Orch::createMySidIpInIpTunnelTermEntry(sai_object_id_t tunnel_oid, const sai_ip6_t& sid_ip, sai_object_id_t& term_entry_oid)
+{
+    SWSS_LOG_ENTER();
+
+    vector<sai_attribute_t> tunnel_table_entry_attrs;
+    sai_attribute_t attr;
+
+    attr.id = SAI_TUNNEL_TERM_TABLE_ENTRY_ATTR_VR_ID;
+    attr.value.oid = gVirtualRouterId;
+    tunnel_table_entry_attrs.push_back(attr);
+
+    attr.id = SAI_TUNNEL_TERM_TABLE_ENTRY_ATTR_TYPE;
+    attr.value.u32 = SAI_TUNNEL_TERM_TABLE_ENTRY_TYPE_P2MP;
+    tunnel_table_entry_attrs.push_back(attr);
+
+    attr.id = SAI_TUNNEL_TERM_TABLE_ENTRY_ATTR_TUNNEL_TYPE;
+    attr.value.s32 = SAI_TUNNEL_TYPE_IPINIP;
+    tunnel_table_entry_attrs.push_back(attr);
+
+    attr.id = SAI_TUNNEL_TERM_TABLE_ENTRY_ATTR_ACTION_TUNNEL_ID;
+    attr.value.oid = tunnel_oid;
+    tunnel_table_entry_attrs.push_back(attr);
+
+    attr.id = SAI_TUNNEL_TERM_TABLE_ENTRY_ATTR_DST_IP;
+    attr.value.ipaddr.addr_family = SAI_IP_ADDR_FAMILY_IPV6;
+    memcpy(attr.value.ipaddr.addr.ip6, sid_ip, sizeof(attr.value.ipaddr.addr.ip6));
+    tunnel_table_entry_attrs.push_back(attr);
+
+    auto status = sai_tunnel_api->create_tunnel_term_table_entry(&term_entry_oid, gSwitchId, (uint32_t)tunnel_table_entry_attrs.size(), tunnel_table_entry_attrs.data());
+    if (status != SAI_STATUS_SUCCESS)
+    {
+        SWSS_LOG_ERROR("Failed to create tunnel decap term entry for MySID - %d", status);
+        return false;
+    }
+
+    return true;
+}
+
+bool Srv6Orch::removeMySidIpInIpTunnelTermEntry(sai_object_id_t term_entry_oid)
+{
+    SWSS_LOG_ENTER();
+
+    auto status = sai_tunnel_api->remove_tunnel_term_table_entry(term_entry_oid);
+    if (status != SAI_STATUS_SUCCESS)
+    {
+        SWSS_LOG_ERROR("Failed to remove tunnel decap term entry for MySID - %d", status);
+        return false;
+    }
+
+    return true;
+}
 
 void Srv6Orch::srv6TunnelUpdateNexthops(const string srv6_source, const NextHopKey nhkey, bool insert)
 {
@@ -645,6 +874,11 @@ bool Srv6Orch::mySidNextHopRequired(const sai_my_sid_entry_endpoint_behavior_t e
     return false;
 }
 
+bool Srv6Orch::mySidTunnelRequired(const sai_my_sid_entry_endpoint_behavior_t end_behavior)
+{
+    return end_behavior == SAI_MY_SID_ENTRY_ENDPOINT_BEHAVIOR_UDT46;
+}
+
 bool Srv6Orch::createUpdateMysidEntry(string my_sid_string, const string dt_vrf, const string adj, const string end_action)
 {
     SWSS_LOG_ENTER();
@@ -763,6 +997,41 @@ bool Srv6Orch::createUpdateMysidEntry(string my_sid_string, const string dt_vrf,
         attributes.push_back(nh_attr);
         nh_update = true;
     }
+
+    if (mySidTunnelRequired(end_behavior))
+    {
+        sai_tunnel_dscp_mode_t dcsp_mode;
+        auto ok = getMySidEntryDscpMode(my_sid_string, dcsp_mode);
+        if (!ok)
+        {
+            SWSS_LOG_ERROR("Failed to get dscp mode for MySID %s", my_sid_string.c_str());
+            return false;
+        }
+
+        srv6_my_sid_table_[key_string].dscp_mode = dcsp_mode;
+
+        sai_object_id_t tunnel_oid;
+        ok = createMySidIpInIpTunnel(dcsp_mode, tunnel_oid);
+        if (!ok)
+        {
+            return false;
+        }
+
+        sai_object_id_t term_entry_oid;
+        ok = createMySidIpInIpTunnelTermEntry(tunnel_oid, my_sid_entry.sid, term_entry_oid);
+        if (!ok)
+        {
+            removeMySidIpInIpTunnel(dcsp_mode);
+            return false;
+        }
+
+        srv6_my_sid_table_[key_string].tunnel_term_entry = term_entry_oid;
+
+        attr.id = SAI_MY_SID_ENTRY_ATTR_TUNNEL_ID;
+        attr.value.oid = tunnel_oid;
+        attributes.push_back(attr);
+    }
+
     attr.id = SAI_MY_SID_ENTRY_ATTR_ENDPOINT_BEHAVIOR;
     attr.value.s32 = end_behavior;
     attributes.push_back(attr);
@@ -843,13 +1112,15 @@ bool Srv6Orch::deleteMysidEntry(const string my_sid_string)
     }
     gCrmOrch->decCrmResUsedCounter(CrmResourceType::CRM_SRV6_MY_SID_ENTRY);
 
+
+    auto endBehavior = srv6_my_sid_table_[my_sid_string].endBehavior;
     /* Decrease VRF refcount */
-    if (mySidVrfRequired(srv6_my_sid_table_[my_sid_string].endBehavior))
+    if (mySidVrfRequired(endBehavior))
     {
         m_vrfOrch->decreaseVrfRefCount(srv6_my_sid_table_[my_sid_string].endVrfString);
     }
     /* Decrease NextHop refcount */
-    if (mySidNextHopRequired(srv6_my_sid_table_[my_sid_string].endBehavior))
+    if (mySidNextHopRequired(endBehavior))
     {
         NextHopKey nexthop = NextHopKey(srv6_my_sid_table_[my_sid_string].endAdjString);
         m_neighOrch->decreaseNextHopRefCount(nexthop, 1);
@@ -857,6 +1128,22 @@ bool Srv6Orch::deleteMysidEntry(const string my_sid_string)
         SWSS_LOG_INFO("Decreasing refcount to %d for Nexthop %s",
           m_neighOrch->getNextHopRefCount(nexthop), nexthop.to_string(false,true).c_str());
     }
+
+    if (mySidTunnelRequired(endBehavior))
+    {
+        auto ok = removeMySidIpInIpTunnelTermEntry(srv6_my_sid_table_[my_sid_string].tunnel_term_entry);
+        if (!ok)
+        {
+            return false;
+        }
+
+        ok = removeMySidIpInIpTunnel(srv6_my_sid_table_[my_sid_string].dscp_mode);
+        if (!ok)
+        {
+            return false;
+        }
+    }
+
     srv6_my_sid_table_.erase(my_sid_string);
     return true;
 }
@@ -907,6 +1194,44 @@ void Srv6Orch::doTaskMySidTable(const KeyOpFieldsValuesTuple & tuple)
     }
 }
 
+void Srv6Orch::doTaskCfgMySidTable(const KeyOpFieldsValuesTuple &tuple)
+{
+    SWSS_LOG_ENTER();
+
+    sai_tunnel_dscp_mode_t dscp_mode = SAI_TUNNEL_DSCP_MODE_UNIFORM_MODEL;
+
+    for (auto i : kfvFieldsValues(tuple))
+    {
+        if (fvField(i) == "dscp_mode")
+        {
+            auto v = fvValue(i);
+            if (!mySidDscpModeToSai(v, dscp_mode))
+            {
+                SWSS_LOG_ERROR("Unexpected MySID dscp mode: %s", v.c_str());
+                return;
+            }
+
+            break;
+        }
+    }
+
+    auto op = kfvOp(tuple);
+    auto my_sid_key = kfvKey(tuple);
+
+    if (op == SET_COMMAND)
+    {
+        my_sid_dscp_cfg_[my_sid_key] = dscp_mode;
+    }
+    else if (op == DEL_COMMAND)
+    {
+        my_sid_dscp_cfg_.erase(my_sid_key);
+    }
+    else
+    {
+        SWSS_LOG_ERROR("Unexpected command");
+    }
+}
+
 void Srv6Orch::doTask(Consumer &consumer)
 {
     SWSS_LOG_ENTER();
@@ -928,7 +1253,12 @@ void Srv6Orch::doTask(Consumer &consumer)
         }
         else if (table_name == APP_SRV6_MY_SID_TABLE_NAME)
         {
-            doTaskMySidTable(t);
+            if (consumer.getDbId() == CONFIG_DB)
+            {
+                doTaskCfgMySidTable(t);
+            } else {
+                doTaskMySidTable(t);
+            }
         }
         else
         {
